@@ -91,8 +91,8 @@ def main():
 💰 Amount: {value_eth:.6f} ETH
 💵 USD Value: ${usd:,.2f}
 
-📤 From: {tx['from'][:12]}...
-📥 To: {tx['to'][:12]}...
+📤 From: {tx['from']}
+📥 To: {tx['to']}
 """
                     send_message(msg)
                 last_seen[eth] = tx["hash"]
@@ -110,8 +110,8 @@ def main():
 💰 Amount: {total:.8f} BTC
 💵 USD Value: ${usd_val:,.2f}
 
-📤 From: {from_addr[:12]}...
-📥 To: {btc[:12]}...
+📤 From: {from_addr}
+📥 To: {btc}
 """
                     send_message(msg)
                 last_seen[btc] = tx["hash"]
@@ -127,8 +127,8 @@ def main():
 🏷️ Wallet: {label}
 💰 Amount: {val:.6f} {symbol}
 
-📤 From: {tx['from'][:12]}...
-📥 To: {tx['to'][:12]}...
+📤 From: {tx['from']}
+📥 To: {tx['to']}
 """
                     send_message(msg)
                 last_seen[tron] = tx["transaction_id"]
