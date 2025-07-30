@@ -1,4 +1,3 @@
-
 import os
 import time
 import requests
@@ -62,35 +61,48 @@ def get_latest_tron_tx(address):
     return None
 
 def get_latest_btc_tx(address):
-    url = f"https://api.blockchair.com/bitcoin/dashboards/address/{address}"
+    url = f"https://api.blockchair.com/bitcoin/dashboards/address/{address}?limit=5"
     try:
         r = requests.get(url).json()
-        txs = r["data"][address]["transactions"]
-        for tx_hash in txs:
-            tx_url = f"https://api.blockchair.com/bitcoin/raw/transaction/{tx_hash}"
-            tx_data = requests.get(tx_url).json()
-            tx = tx_data["data"][tx_hash]["decoded_raw_transaction"]
-            for out in tx["vout"]:
-                if "scriptpubkey_address" in out and out["scriptpubkey_address"] == address:
-                    return {
-                        "hash": tx_hash,
-                        "from": tx["vin"][0]["prevout"]["scriptpubkey_address"] if tx["vin"] else "unknown",
+        data = r.get("data", {}).get(address, {})
+        txs = data.get("transactions", [])
+        raw_tx_map = {}
+
+        if txs:
+            tx_ids = ",".join(txs[:3])
+            tx_url = f"https://api.blockchair.com/bitcoin/dashboards/transactions/{tx_ids}"
+            tx_resp = requests.get(tx_url).json()
+            raw_tx_map = tx_resp.get("data", {})
+
+        tx_list = []
+        for txid, info in raw_tx_map.items():
+            tx = info.get("transaction", {})
+            outputs = info.get("outputs", [])
+            for out in outputs:
+                if out.get("recipient") == address:
+                    amount_btc = out.get("value", 0) / 1e8
+                    tx_list.append({
+                        "hash": txid,
+                        "from": tx.get("sender") or "unknown",
                         "to": address,
-                        "amount": out["value"] / 1e8
-                    }
-    except:
-        pass
-    return None
+                        "amount": amount_btc,
+                        "time": tx.get("time"),
+                        "block_id": tx.get("block_id", 0)
+                    })
+        return sorted(tx_list, key=lambda x: x["time"], reverse=True)
+    except Exception as e:
+        print(f"[BTC Error] {e}")
+        return []
 
 def main():
-    seen_hashes = set()
+    last_seen = {}
     while True:
         eth_price = get_price("ETHUSDT")
         btc_price = get_price("BTCUSDT")
 
         for eth, label in ETH_WALLETS.items():
             tx = get_latest_eth_tx(eth)
-            if tx and tx["hash"] not in seen_hashes:
+            if tx and tx["hash"] != last_seen.get(eth):
                 value_eth = int(tx["value"]) / 1e18
                 usd = value_eth * eth_price
                 if usd >= 2:
@@ -104,28 +116,32 @@ def main():
 📥 To: {tx['to']}
 """
                     send_message(msg)
-                seen_hashes.add(tx["hash"])
+                last_seen[eth] = tx["hash"]
 
         for btc, label in BTC_WALLETS.items():
-            tx = get_latest_btc_tx(btc)
-            if tx and tx["hash"] not in seen_hashes:
+            tx_list = get_latest_btc_tx(btc)
+            for tx in tx_list:
+                tx_id = tx["hash"]
+                key = f"{btc}_{tx_id}"
+                if key in last_seen:
+                    continue
                 usd_val = tx["amount"] * btc_price
                 if usd_val >= 2:
                     msg = f"""🔔 BTC Incoming Transaction
 
 🏷️ Wallet: {label}
-💰 Amount: {tx["amount"]:.8f} BTC
+💰 Amount: {tx['amount']:.8f} BTC
 💵 USD Value: ${usd_val:,.2f}
 
-📤 From: {tx["from"]}
-📥 To: {tx["to"]}
+📤 From: {tx['from']}
+📥 To: {tx['to']}
 """
                     send_message(msg)
-                seen_hashes.add(tx["hash"])
+                last_seen[key] = True
 
         for tron, label in TRON_WALLETS.items():
             tx = get_latest_tron_tx(tron)
-            if tx and tx["transaction_id"] not in seen_hashes:
+            if tx and tx["transaction_id"] != last_seen.get(tron):
                 val = int(tx["value"]) / (10**int(tx["token_info"]["decimals"]))
                 symbol = tx["token_info"]["symbol"]
                 if val > 0:
@@ -138,7 +154,7 @@ def main():
 📥 To: {tx['to']}
 """
                     send_message(msg)
-                seen_hashes.add(tx["transaction_id"])
+                last_seen[tron] = tx["transaction_id"]
 
         time.sleep(10)
 
