@@ -9,6 +9,11 @@ ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
 BTC_LABELS = os.getenv("BTC_LABELS")
 ETH_LABELS = os.getenv("ETH_LABELS")
 
+# ✅ ตรวจว่าทุกตัวแปรมีค่าหรือไม่
+if not all([TELEGRAM_TOKEN, CHAT_ID, ETHERSCAN_API_KEY, BTC_LABELS, ETH_LABELS]):
+    raise ValueError("❌ Environment variables ไม่ครบ กรุณาตรวจ Railway > Variables")
+
+
 btc_wallets = [{"type": "BTC", "address": a, "name": n} for a, n in (w.split(":") for w in BTC_LABELS.split(","))]
 eth_wallets = [{"type": "ETH", "address": a, "name": n} for a, n in (w.split(":") for w in ETH_LABELS.split(","))]
 wallets = btc_wallets + eth_wallets
