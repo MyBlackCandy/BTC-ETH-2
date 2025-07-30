@@ -66,38 +66,31 @@ def get_latest_btc_tx(address):
     try:
         r = requests.get(url).json()
         txs = r["data"][address]["transactions"]
-        if not txs:
-            return None
-        txid = txs[0]
-        tx_url = f"https://api.blockchair.com/bitcoin/dashboards/transaction/{txid}"
-        tx_detail = requests.get(tx_url).json()
-        tx_data = tx_detail["data"][txid]["transaction"]
-        inputs = tx_detail["data"][txid]["inputs"]
-        outputs = tx_detail["data"][txid]["outputs"]
-
-        total_in = 0
-        for o in outputs:
-            if o["recipient"] == address:
-                total_in += int(o["value"]) / 1e8
-
-        return {
-            "hash": txid,
-            "amount": total_in,
-            "from": inputs[0]["recipient"] if inputs else "unknown"
-        }
-    except Exception as e:
-        print("BTC API Error:", e)
-        return None
+        for tx_hash in txs:
+            tx_url = f"https://api.blockchair.com/bitcoin/raw/transaction/{tx_hash}"
+            tx_data = requests.get(tx_url).json()
+            tx = tx_data["data"][tx_hash]["decoded_raw_transaction"]
+            for out in tx["vout"]:
+                if "scriptpubkey_address" in out and out["scriptpubkey_address"] == address:
+                    return {
+                        "hash": tx_hash,
+                        "from": tx["vin"][0]["prevout"]["scriptpubkey_address"] if tx["vin"] else "unknown",
+                        "to": address,
+                        "amount": out["value"] / 1e8
+                    }
+    except:
+        pass
+    return None
 
 def main():
-    last_seen = {}
+    seen_hashes = set()
     while True:
         eth_price = get_price("ETHUSDT")
         btc_price = get_price("BTCUSDT")
 
         for eth, label in ETH_WALLETS.items():
             tx = get_latest_eth_tx(eth)
-            if tx and tx["hash"] != last_seen.get(eth):
+            if tx and tx["hash"] not in seen_hashes:
                 value_eth = int(tx["value"]) / 1e18
                 usd = value_eth * eth_price
                 if usd >= 2:
@@ -111,30 +104,28 @@ def main():
 📥 To: {tx['to']}
 """
                     send_message(msg)
-                last_seen[eth] = tx["hash"]
+                seen_hashes.add(tx["hash"])
 
         for btc, label in BTC_WALLETS.items():
             tx = get_latest_btc_tx(btc)
-            if tx and tx["hash"] != last_seen.get(btc):
-                amount = tx["amount"]
-                usd_val = amount * btc_price
+            if tx and tx["hash"] not in seen_hashes:
+                usd_val = tx["amount"] * btc_price
                 if usd_val >= 2:
-                    from_addr = tx["from"]
                     msg = f"""🔔 BTC Incoming Transaction
 
 🏷️ Wallet: {label}
-💰 Amount: {amount:.8f} BTC
+💰 Amount: {tx["amount"]:.8f} BTC
 💵 USD Value: ${usd_val:,.2f}
 
-📤 From: {from_addr}
-📥 To: {btc}
+📤 From: {tx["from"]}
+📥 To: {tx["to"]}
 """
                     send_message(msg)
-                last_seen[btc] = tx["hash"]
+                seen_hashes.add(tx["hash"])
 
         for tron, label in TRON_WALLETS.items():
             tx = get_latest_tron_tx(tron)
-            if tx and tx["transaction_id"] != last_seen.get(tron):
+            if tx and tx["transaction_id"] not in seen_hashes:
                 val = int(tx["value"]) / (10**int(tx["token_info"]["decimals"]))
                 symbol = tx["token_info"]["symbol"]
                 if val > 0:
@@ -147,7 +138,7 @@ def main():
 📥 To: {tx['to']}
 """
                     send_message(msg)
-                last_seen[tron] = tx["transaction_id"]
+                seen_hashes.add(tx["transaction_id"])
 
         time.sleep(10)
 
