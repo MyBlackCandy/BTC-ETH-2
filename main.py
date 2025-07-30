@@ -1,3 +1,4 @@
+
 import os
 import time
 import requests
@@ -61,17 +62,32 @@ def get_latest_tron_tx(address):
     return None
 
 def get_latest_btc_tx(address):
-    url = f"https://blockchain.info/rawaddr/{address}"
+    url = f"https://api.blockchair.com/bitcoin/dashboards/address/{address}"
     try:
         r = requests.get(url).json()
-        txs = r.get("txs", [])
-        for tx in txs:
-            for out in tx["out"]:
-                if out.get("addr") == address:
-                    return tx
-    except:
-        pass
-    return None
+        txs = r["data"][address]["transactions"]
+        if not txs:
+            return None
+        txid = txs[0]
+        tx_url = f"https://api.blockchair.com/bitcoin/dashboards/transaction/{txid}"
+        tx_detail = requests.get(tx_url).json()
+        tx_data = tx_detail["data"][txid]["transaction"]
+        inputs = tx_detail["data"][txid]["inputs"]
+        outputs = tx_detail["data"][txid]["outputs"]
+
+        total_in = 0
+        for o in outputs:
+            if o["recipient"] == address:
+                total_in += int(o["value"]) / 1e8
+
+        return {
+            "hash": txid,
+            "amount": total_in,
+            "from": inputs[0]["recipient"] if inputs else "unknown"
+        }
+    except Exception as e:
+        print("BTC API Error:", e)
+        return None
 
 def main():
     last_seen = {}
@@ -100,14 +116,14 @@ def main():
         for btc, label in BTC_WALLETS.items():
             tx = get_latest_btc_tx(btc)
             if tx and tx["hash"] != last_seen.get(btc):
-                total = sum([out["value"] for out in tx["out"] if out.get("addr") == btc]) / 1e8
-                usd_val = total * btc_price
+                amount = tx["amount"]
+                usd_val = amount * btc_price
                 if usd_val >= 2:
-                    from_addr = tx.get("inputs", [{}])[0].get("prev_out", {}).get("addr", "unknown")
+                    from_addr = tx["from"]
                     msg = f"""🔔 BTC Incoming Transaction
 
 🏷️ Wallet: {label}
-💰 Amount: {total:.8f} BTC
+💰 Amount: {amount:.8f} BTC
 💵 USD Value: ${usd_val:,.2f}
 
 📤 From: {from_addr}
