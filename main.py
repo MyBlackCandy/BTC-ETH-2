@@ -4,7 +4,7 @@ import requests
 from collections import defaultdict
 
 # === ENV ===
-TG_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+TG_TOKEN = os.getenv("BOT_TOKEN") 
 TG_CHAT_ID = os.getenv("CHAT_ID")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
 
