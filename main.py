@@ -1,19 +1,39 @@
 import os
 import time
 import requests
+import calendar
 from collections import defaultdict
 
 # === ENV ===
-TG_TOKEN = os.getenv("BOT_TOKEN") 
+TG_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 TG_CHAT_ID = os.getenv("CHAT_ID")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
 
 ETH_ADDR_ENV = os.getenv("ETH_ADDRESS", "")
 TRON_ADDR_ENV = os.getenv("TRON_ADDRESS", "")
 BTC_ADDR_ENV = os.getenv("BTC_ADDRESS", "")
-BTC_CONFIRM_UPDATE = os.getenv("BTC_CONFIRM_UPDATE", "true").lower() in ("1","true","yes","y")
 
-SEEN_LIMIT = int(os.getenv("SEEN_LIMIT", "50"))  # จำกัดจำนวน TX ที่จำต่อ address
+BTC_CONFIRM_UPDATE = os.getenv("BTC_CONFIRM_UPDATE", "true").lower() in ("1","true","yes","y")
+BTC_USE_FIRST_SEEN = os.getenv("BTC_USE_FIRST_SEEN", "false").lower() in ("1","true","yes","y")
+
+# Timezone for DISPLAY (+ optional cutoff in local)
+TIME_OFFSET_HOURS = int(os.getenv("TIME_OFFSET_HOURS", "0"))
+TIME_LABEL = os.getenv("TIME_LABEL", "").strip()
+if not TIME_LABEL:
+    TIME_LABEL = "北京时间" if TIME_OFFSET_HOURS == 8 else (f"UTC{('+' if TIME_OFFSET_HOURS>=0 else '')}{TIME_OFFSET_HOURS}" if TIME_OFFSET_HOURS else "UTC")
+OFFSET_SEC = TIME_OFFSET_HOURS * 3600
+
+# Cutoff (UTC and/or Local-Beijing)
+GLOBAL_CUTOFF_UTC = os.getenv("NOTIFY_AFTER_UTC", "").strip()
+GLOBAL_CUTOFF_LOCAL = os.getenv("NOTIFY_AFTER_LOCAL", "").strip()
+BTC_CUTOFF_UTC = os.getenv("BTC_NOTIFY_AFTER_UTC", "").strip()
+ETH_CUTOFF_UTC = os.getenv("ETH_NOTIFY_AFTER_UTC", "").strip()
+TRON_CUTOFF_UTC = os.getenv("TRON_NOTIFY_AFTER_UTC", "").strip()
+BTC_CUTOFF_LOCAL = os.getenv("BTC_NOTIFY_AFTER_LOCAL", "").strip()
+ETH_CUTOFF_LOCAL = os.getenv("ETH_NOTIFY_AFTER_LOCAL", "").strip()
+TRON_CUTOFF_LOCAL = os.getenv("TRON_NOTIFY_AFTER_LOCAL", "").strip()
+
+SEEN_LIMIT = int(os.getenv("SEEN_LIMIT", "50"))
 
 # === Helpers ===
 def parse_addresses(env_value):
@@ -43,34 +63,62 @@ def send_message(msg):
 
 def get_price(symbol):
     try:
-        r = requests.get(
-            f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
-            timeout=10,
-        ).json()
+        r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=10).json()
         return float(r["price"])
     except Exception:
         return 0.0
 
-def fmt_ts_utc(epoch_sec):
+def fmt_ts_local(epoch_sec):
+    """Return local time string with label, e.g. '2025-08-10 23:37:11 北京时间'."""
     try:
-        return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(epoch_sec)))
+        local_epoch = int(epoch_sec) + OFFSET_SEC
+        return time.strftime("%Y-%m-%d %H:%M:%S ", time.gmtime(local_epoch)) + TIME_LABEL
     except Exception:
-        return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        local_epoch = int(time.time()) + OFFSET_SEC
+        return time.strftime("%Y-%m-%d %H:%M:%S ", time.gmtime(local_epoch)) + TIME_LABEL
+
+def parse_cutoff(value: str, assume_local: bool=False) -> int:
+    """
+    Parse 'YYYY-MM-DD[ HH:MM:SS]' or epoch seconds (string).
+    Return epoch (UTC). If assume_local=True, interpret the datetime string as LOCAL (UTC+OFFSET) then convert to UTC.
+    """
+    v = (value or "").strip()
+    if not v:
+        return 0
+    # numeric -> assume epoch seconds (UTC)
+    if v.isdigit() and len(v) >= 10:
+        try:
+            return int(v)
+        except Exception:
+            return 0
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            t = time.strptime(v, fmt)
+            epoch_utc = calendar.timegm(t)
+            return epoch_utc - OFFSET_SEC if assume_local else epoch_utc
+        except Exception:
+            continue
+    return 0
+
+GLOBAL_CUTOFF_TS = parse_cutoff(GLOBAL_CUTOFF_LOCAL, assume_local=True) or parse_cutoff(GLOBAL_CUTOFF_UTC)
+BTC_CUTOFF_TS = parse_cutoff(BTC_CUTOFF_LOCAL, assume_local=True) or parse_cutoff(BTC_CUTOFF_UTC) or GLOBAL_CUTOFF_TS
+ETH_CUTOFF_TS = parse_cutoff(ETH_CUTOFF_LOCAL, assume_local=True) or parse_cutoff(ETH_CUTOFF_UTC) or GLOBAL_CUTOFF_TS
+TRON_CUTOFF_TS = parse_cutoff(TRON_CUTOFF_LOCAL, assume_local=True) or parse_cutoff(TRON_CUTOFF_UTC) or GLOBAL_CUTOFF_TS
 
 # === ETH ===
 def get_latest_eth_tx(address):
-    url = (
-        "https://api.etherscan.io/api"
-        f"?module=account&action=txlist&address={address}"
-        f"&sort=desc&apikey={ETHERSCAN_API_KEY}"
-    )
+    url = ("https://api.etherscan.io/api"
+           f"?module=account&action=txlist&address={address}"
+           f"&sort=desc&apikey={ETHERSCAN_API_KEY}")
     try:
         r = requests.get(url, timeout=15).json()
         txs = r.get("result", [])
         for tx in txs:
             if str(tx.get("to", "")).lower() == address.lower():
+                ts = int(tx.get("timeStamp", "0"))
                 tx["_amount_eth"] = int(tx.get("value", "0")) / 1e18
-                tx["_time_utc"] = fmt_ts_utc(tx.get("timeStamp", 0))
+                tx["_time_local"] = fmt_ts_local(ts)
+                tx["_epoch"] = ts
                 tx["_from"] = tx.get("from", "")
                 tx["_to"] = tx.get("to", "")
                 tx["_hash"] = tx.get("hash", "")
@@ -90,7 +138,7 @@ def get_latest_tron_tx(address):
                 decimals = int(tx.get("token_info", {}).get("decimals", 6))
                 val = int(tx.get("value", "0")) / (10 ** decimals)
                 symbol = tx.get("token_info", {}).get("symbol", "TRC20")
-                ts_ms = tx.get("block_timestamp", 0)
+                ts_ms = int(tx.get("block_timestamp", 0))
                 ts = int(ts_ms // 1000) if ts_ms else 0
                 return {
                     "_amount": val,
@@ -98,7 +146,8 @@ def get_latest_tron_tx(address):
                     "_from": tx.get("from", ""),
                     "_to": tx.get("to", ""),
                     "_txid": tx.get("transaction_id", ""),
-                    "_time_utc": fmt_ts_utc(ts),
+                    "_time_local": fmt_ts_local(ts),
+                    "_epoch": ts,
                 }
     except Exception as e:
         print("TRON fetch error:", e)
@@ -120,26 +169,38 @@ def _first_input_from_address_btc(tx):
     except Exception:
         return "不明"
 
+def _btc_first_seen_epoch(txid):
+    if not BTC_USE_FIRST_SEEN:
+        return int(time.time())
+    try:
+        j = requests.get(f"https://mempool.space/api/tx/{txid}", timeout=10).json()
+        v = j.get("firstSeen") or j.get("received") or j.get("timestamp") or 0
+        v = int(v)
+        if v > 10**12:  # ms -> s
+            v //= 1000
+        return v if v > 0 else int(time.time())
+    except Exception:
+        return int(time.time())
+
 def get_btc_txs_mempool(address, max_items=25):
-    """
-    คืนลิสต์ TX (ทั้ง mempool และ chain) ที่มี output ไปยัง address นี้
-    ไม่รับประกันลำดับเวลา จึงให้ main loop เช็ค 'ยังไม่เคยเห็น' ทีละรายการ
-    """
     base = "https://mempool.space/api/address"
     results = []
 
-    # Unconfirmed (mempool)
+    # Unconfirmed
     try:
         mem_txs = requests.get(f"{base}/{address}/txs/mempool", timeout=15).json()
         for tx in mem_txs or []:
             amount_btc = _sum_outputs_to_address_btc(tx, address)
             if amount_btc > 0:
+                txid = tx.get("txid", "")
+                epoch = _btc_first_seen_epoch(txid)
                 results.append({
                     "_amount_btc": amount_btc,
                     "_from": _first_input_from_address_btc(tx),
                     "_to": address,
-                    "_txid": tx.get("txid", ""),
-                    "_time_utc": fmt_ts_utc(int(time.time())),  # seen time
+                    "_txid": txid,
+                    "_time_local": fmt_ts_local(epoch),
+                    "_epoch": epoch,
                     "_confirmed": False,
                 })
             if len(results) >= max_items:
@@ -147,20 +208,21 @@ def get_btc_txs_mempool(address, max_items=25):
     except Exception as e:
         print("BTC mempool fetch error:", e)
 
-    # Confirmed (chain)
+    # Confirmed
     try:
         chain_txs = requests.get(f"{base}/{address}/txs/chain", timeout=15).json()
         for tx in chain_txs or []:
             amount_btc = _sum_outputs_to_address_btc(tx, address)
             if amount_btc > 0:
                 status = tx.get("status", {}) or {}
-                block_time = status.get("block_time", 0)
+                block_time = int(status.get("block_time", 0)) or int(time.time())
                 results.append({
                     "_amount_btc": amount_btc,
                     "_from": _first_input_from_address_btc(tx),
                     "_to": address,
                     "_txid": tx.get("txid", ""),
-                    "_time_utc": fmt_ts_utc(block_time if block_time else int(time.time())),
+                    "_time_local": fmt_ts_local(block_time),
+                    "_epoch": block_time,
                     "_confirmed": True,
                 })
             if len(results) >= max_items:
@@ -192,6 +254,8 @@ def main():
                 continue
             tx = get_latest_eth_tx(addr)
             if tx:
+                if ETH_CUTOFF_TS and tx["_epoch"] and tx["_epoch"] < ETH_CUTOFF_TS:
+                    continue
                 if tx["_hash"] not in seen[addr]:
                     usd = tx["_amount_eth"] * eth_price
                     name_line = f"（{label}）" if label else ""
@@ -200,7 +264,7 @@ def main():
                         f"账户{name_line}\n"
                         f"我们地址: `{tx['_to']}`\n"
                         f"客户地址: `{tx['_from']}`\n"
-                        f"时间: {tx['_time_utc']}\n"
+                        f"时间: {tx['_time_local']}\n"
                         f"💰 {tx['_amount_eth']:.6f} ETH ≈ ${usd:,.2f}\n"
                         f"TXID: `{tx['_hash']}`"
                     )
@@ -214,21 +278,24 @@ def main():
             if not addr:
                 continue
             tx = get_latest_tron_tx(addr)
-            if tx and tx["_txid"] not in seen[addr]:
-                name_line = f"（{label}）" if label else ""
-                msg = (
-                    f"*[TRC20] 入金*\n"
-                    f"账户{name_line}\n"
-                    f"我们地址: `{tx['_to']}`\n"
-                    f"客户地址: `{tx['_from']}`\n"
-                    f"时间: {tx['_time_utc']}\n"
-                    f"💰 {tx['_amount']} {tx['_symbol']}\n"
-                    f"TXID: `{tx['_txid']}`"
-                )
-                send_message(msg)
-                seen[addr][tx["_txid"]] = {"confirmed": True, "ts": int(time.time())}
+            if tx:
+                if TRON_CUTOFF_TS and tx["_epoch"] and tx["_epoch"] < TRON_CUTOFF_TS:
+                    continue
+                if tx["_txid"] not in seen[addr]:
+                    name_line = f"（{label}）" if label else ""
+                    msg = (
+                        f"*[TRC20] 入金*\n"
+                        f"账户{name_line}\n"
+                        f"我们地址: `{tx['_to']}`\n"
+                        f"客户地址: `{tx['_from']}`\n"
+                        f"时间: {tx['_time_local']}\n"
+                        f"💰 {tx['_amount']} {tx['_symbol']}\n"
+                        f"TXID: `{tx['_txid']}`"
+                    )
+                    send_message(msg)
+                    seen[addr][tx["_txid"]] = {"confirmed": True, "ts": int(time.time())}
 
-        # --- BTC (mempool.space): send for ALL unseen + confirm updates ---
+        # --- BTC ---
         for item in BTC_ADDRESSES:
             addr = item["address"].strip()
             label = item["label"]
@@ -239,30 +306,29 @@ def main():
             if not txs:
                 continue
 
-            # ตรวจทุกรายการ
             for tx in txs:
+                if BTC_CUTOFF_TS and tx["_epoch"] and tx["_epoch"] < BTC_CUTOFF_TS:
+                    continue
+
                 prev = seen[addr].get(tx["_txid"])
                 name_line = f"（{label}）" if label else ""
                 status_line = "已确认 ✅" if tx["_confirmed"] else "未确认 ⏳"
                 usd_val = tx["_amount_btc"] * btc_price
 
                 if not prev:
-                    # TX ใหม่ (ยังไม่เคยแจ้ง)
                     msg = (
                         f"*[BTC] 入金*\n"
                         f"账户{name_line}\n"
                         f"状态: {status_line}\n"
                         f"我们地址: `{tx['_to']}`\n"
                         f"客户地址: `{tx['_from']}`\n"
-                        f"时间: {tx['_time_utc']}\n"
+                        f"时间: {tx['_time_local']}\n"
                         f"💰 {tx['_amount_btc']:.8f} BTC ≈ ${usd_val:,.2f}\n"
                         f"TXID: `{tx['_txid']}`"
                     )
                     send_message(msg)
                     seen[addr][tx["_txid"]] = {"confirmed": tx["_confirmed"], "ts": int(time.time())}
-
                 else:
-                    # เคยแจ้งแล้ว → เช็คเปลี่ยนสถานะ
                     if BTC_CONFIRM_UPDATE and (not prev["confirmed"]) and tx["_confirmed"]:
                         msg = (
                             f"*[BTC] 状态更新*\n"
@@ -270,16 +336,15 @@ def main():
                             f"状态: 已确认 ✅\n"
                             f"我们地址: `{tx['_to']}`\n"
                             f"客户地址: `{tx['_from']}`\n"
-                            f"时间: {tx['_time_utc']}\n"
+                            f"时间: {tx['_time_local']}\n"
                             f"💰 {tx['_amount_btc']:.8f} BTC ≈ ${usd_val:,.2f}\n"
                             f"TXID: `{tx['_txid']}`"
                         )
                         send_message(msg)
                         prev["confirmed"] = True
 
-            # ตัดทิ้งรายการเก่า ๆ กันโตเกิน
+            # cleanup
             if len(seen[addr]) > SEEN_LIMIT:
-                # ลบตามลำดับเวลาเก่าไปใหม่
                 for txid in sorted(seen[addr], key=lambda k: seen[addr][k]["ts"])[:-SEEN_LIMIT]:
                     seen[addr].pop(txid, None)
 
