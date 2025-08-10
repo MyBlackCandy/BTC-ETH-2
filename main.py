@@ -3,19 +3,17 @@ import time
 import requests
 
 # === ENV ===
-TG_TOKEN = os.getenv("BOT_TOKEN")
+TG_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 TG_CHAT_ID = os.getenv("CHAT_ID")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
 
 ETH_ADDR_ENV = os.getenv("ETH_ADDRESS", "")
 TRON_ADDR_ENV = os.getenv("TRON_ADDRESS", "")
 BTC_ADDR_ENV = os.getenv("BTC_ADDRESS", "")
+BTC_CONFIRM_UPDATE = os.getenv("BTC_CONFIRM_UPDATE", "true").lower() in ("1","true","yes","y")
 
 # === Helpers ===
 def parse_addresses(env_value):
-    """
-    Parse 'addr[:label],addr2[:label2]' -> [{'address': addr, 'label': label}, ...]
-    """
     result = []
     for raw in env_value.split(","):
         raw = raw.strip()
@@ -51,18 +49,13 @@ def get_price(symbol):
         return 0.0
 
 def fmt_ts_utc(epoch_sec):
-    """Format epoch seconds to 'YYYY-MM-DD HH:MM:SS UTC'"""
     try:
         return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(epoch_sec)))
     except Exception:
         return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
-# === Chain-specific fetchers ===
+# === ETH ===
 def get_latest_eth_tx(address):
-    """
-    Return latest incoming normal ETH tx to 'address' (not internal),
-    from Etherscan 'txlist' (sorted desc).
-    """
     url = (
         "https://api.etherscan.io/api"
         f"?module=account&action=txlist&address={address}"
@@ -72,9 +65,7 @@ def get_latest_eth_tx(address):
         r = requests.get(url, timeout=15).json()
         txs = r.get("result", [])
         for tx in txs:
-            # Incoming to our address
             if str(tx.get("to", "")).lower() == address.lower():
-                # Add normalized fields we need
                 tx["_amount_eth"] = int(tx.get("value", "0")) / 1e18
                 tx["_time_utc"] = fmt_ts_utc(tx.get("timeStamp", 0))
                 tx["_from"] = tx.get("from", "")
@@ -85,17 +76,14 @@ def get_latest_eth_tx(address):
         print("ETH fetch error:", e)
     return None
 
+# === TRON (TRC20) ===
 def get_latest_tron_tx(address):
-    """
-    Latest incoming TRC20 transfer to 'address' via Trongrid.
-    """
     url = f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20?limit=10"
     try:
         r = requests.get(url, timeout=15).json()
         txs = r.get("data", []) or []
         for tx in txs:
             if tx.get("to") == address:
-                # Normalize
                 decimals = int(tx.get("token_info", {}).get("decimals", 6))
                 val = int(tx.get("value", "0")) / (10 ** decimals)
                 symbol = tx.get("token_info", {}).get("symbol", "TRC20")
@@ -113,8 +101,8 @@ def get_latest_tron_tx(address):
         print("TRON fetch error:", e)
     return None
 
+# === BTC via mempool.space ===
 def _sum_outputs_to_address_btc(tx, address):
-    """Sum vout value to 'address' in BTC (from satoshis)."""
     total_sats = 0
     for vout in tx.get("vout", []):
         if vout.get("scriptpubkey_address") == address:
@@ -130,13 +118,8 @@ def _first_input_from_address_btc(tx):
         return "不明"
 
 def get_latest_btc_tx_mempool(address):
-    """
-    Use mempool.space (Esplora) API.
-    - Check mempool txs first (/txs/mempool), then confirmed chain (/txs/chain).
-    - Return normalized dict with amount, txid, time_utc (block_time if confirmed; else now).
-    """
     base = "https://mempool.space/api/address"
-    # 1) mempool (unconfirmed)
+    # 1) mempool (unconfirmed first)
     try:
         mem_txs = requests.get(f"{base}/{address}/txs/mempool", timeout=15).json()
         for tx in mem_txs or []:
@@ -144,8 +127,7 @@ def get_latest_btc_tx_mempool(address):
             if amount_btc > 0:
                 txid = tx.get("txid", "")
                 from_addr = _first_input_from_address_btc(tx)
-                # No block_time for unconfirmed; use bot-seen time
-                time_utc = fmt_ts_utc(int(time.time()))
+                time_utc = fmt_ts_utc(int(time.time()))  # seen time
                 return {
                     "_amount_btc": amount_btc,
                     "_from": from_addr,
@@ -184,11 +166,12 @@ def get_latest_btc_tx_mempool(address):
 # === Main loop ===
 def main():
     if not all([TG_TOKEN, TG_CHAT_ID]):
-        raise ValueError("❌ Missing BOT_TOKEN or CHAT_ID")
+        raise ValueError("❌ Missing BOT_TOKEN/TELEGRAM_TOKEN or CHAT_ID")
     if not ETHERSCAN_API_KEY and ETH_ADDRESSES:
         print("⚠️ ETHERSCAN_API_KEY not set; ETH monitoring may fail.")
 
-    last_seen = {}  # {address: txid/hash}
+    # last_seen[address] = {"txid": str, "confirmed": bool}
+    last_seen = {}
 
     while True:
         eth_price = get_price("ETHUSDT")
@@ -201,20 +184,22 @@ def main():
             if not addr:
                 continue
             tx = get_latest_eth_tx(addr)
-            if tx and tx["_hash"] != last_seen.get(addr):
-                usd = tx["_amount_eth"] * eth_price
-                name_line = f"（{label}）" if label else ""
-                msg = (
-                    f"*[ETH] 入金*\n"
-                    f"账户{name_line}\n"
-                    f"我们地址: `{tx['_to']}`\n"
-                    f"客户地址: `{tx['_from']}`\n"
-                    f"时间: {tx['_time_utc']}\n"
-                    f"💰 {tx['_amount_eth']:.6f} ETH ≈ ${usd:,.2f}\n"
-                    f"TXID: `{tx['_hash']}`"
-                )
-                send_message(msg)
-                last_seen[addr] = tx["_hash"]
+            if tx:
+                prev = last_seen.get(addr)
+                if not prev or tx["_hash"] != prev.get("txid"):
+                    usd = tx["_amount_eth"] * eth_price
+                    name_line = f"（{label}）" if label else ""
+                    msg = (
+                        f"*[ETH] 入金*\n"
+                        f"账户{name_line}\n"
+                        f"我们地址: `{tx['_to']}`\n"
+                        f"客户地址: `{tx['_from']}`\n"
+                        f"时间: {tx['_time_utc']}\n"
+                        f"💰 {tx['_amount_eth']:.6f} ETH ≈ ${usd:,.2f}\n"
+                        f"TXID: `{tx['_hash']}`"
+                    )
+                    send_message(msg)
+                    last_seen[addr] = {"txid": tx["_hash"], "confirmed": True}  # etherscan list is mined only
 
         # --- TRON (TRC20) ---
         for item in TRON_ADDRESSES:
@@ -223,35 +208,43 @@ def main():
             if not addr:
                 continue
             tx = get_latest_tron_tx(addr)
-            if tx and tx["_txid"] != last_seen.get(addr):
-                name_line = f"（{label}）" if label else ""
-                msg = (
-                    f"*[TRC20] 入金*\n"
-                    f"账户{name_line}\n"
-                    f"我们地址: `{tx['_to']}`\n"
-                    f"客户地址: `{tx['_from']}`\n"
-                    f"时间: {tx['_time_utc']}\n"
-                    f"💰 {tx['_amount']} {tx['_symbol']}\n"
-                    f"TXID: `{tx['_txid']}`"
-                )
-                send_message(msg)
-                last_seen[addr] = tx["_txid"]
+            if tx:
+                prev = last_seen.get(addr)
+                if not prev or tx["_txid"] != prev.get("txid"):
+                    name_line = f"（{label}）" if label else ""
+                    msg = (
+                        f"*[TRC20] 入金*\n"
+                        f"账户{name_line}\n"
+                        f"我们地址: `{tx['_to']}`\n"
+                        f"客户地址: `{tx['_from']}`\n"
+                        f"时间: {tx['_time_utc']}\n"
+                        f"💰 {tx['_amount']} {tx['_symbol']}\n"
+                        f"TXID: `{tx['_txid']}`"
+                    )
+                    send_message(msg)
+                    last_seen[addr] = {"txid": tx["_txid"], "confirmed": True}
 
-        # --- BTC (mempool.space) ---
+        # --- BTC (mempool.space) with confirm-update ---
         for item in BTC_ADDRESSES:
             addr = item["address"].strip()
             label = item["label"]
             if not addr:
                 continue
             tx = get_latest_btc_tx_mempool(addr)
-            if tx and tx["_txid"] != last_seen.get(addr):
-                usd_val = tx["_amount_btc"] * btc_price
-                name_line = f"（{label}）" if label else ""
-                status_line = "已确认 ✅" if tx["_confirmed"] else "未确认 ⏳"
+            if not tx:
+                continue
+
+            prev = last_seen.get(addr)
+            name_line = f"（{label}）" if label else ""
+            status_line = "已确认 ✅" if tx["_confirmed"] else "未确认 ⏳"
+            usd_val = tx["_amount_btc"] * btc_price
+
+            if not prev or tx["_txid"] != prev.get("txid"):
+                # New tx -> send first notice
                 msg = (
                     f"*[BTC] 入金*\n"
                     f"账户{name_line}\n"
-                  
+                    f"状态: {status_line}\n"
                     f"我们地址: `{tx['_to']}`\n"
                     f"客户地址: `{tx['_from']}`\n"
                     f"时间: {tx['_time_utc']}\n"
@@ -259,10 +252,29 @@ def main():
                     f"TXID: `{tx['_txid']}`"
                 )
                 send_message(msg)
-                last_seen[addr] = tx["_txid"]
+                last_seen[addr] = {"txid": tx["_txid"], "confirmed": tx["_confirmed"]}
+
+            else:
+                # Same tx as before -> check status change
+                if (
+                    BTC_CONFIRM_UPDATE
+                    and (not prev.get("confirmed", False))
+                    and tx["_confirmed"]
+                ):
+                    msg = (
+                        f"*[BTC] 状态更新*\n"
+                        f"账户{name_line}\n"
+                        f"状态: 已确认 ✅\n"
+                        f"我们地址: `{tx['_to']}`\n"
+                        f"客户地址: `{tx['_from']}`\n"
+                        f"时间: {tx['_time_utc']}\n"
+                        f"💰 {tx['_amount_btc']:.8f} BTC ≈ ${usd_val:,.2f}\n"
+                        f"TXID: `{tx['_txid']}`"
+                    )
+                    send_message(msg)
+                    prev["confirmed"] = True  # update state
 
         time.sleep(5)
 
 if __name__ == "__main__":
     main()
-E
